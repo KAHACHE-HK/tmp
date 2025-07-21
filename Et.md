@@ -867,3 +867,180 @@ If Err.Number <> 0 Then
     WScript.Echo "Error calling GetData: " & Err.Description
 Else
     WScript.Echo "Result from GetData(42): "
+*Thinking...*
+
+> **Addressing the Core Issue**
+> 
+> I'm focusing on the client's need to know the new ProgID, which highlights the core problem in this pattern. The user's experience is the key. Deployment friction is a serious factor. I need to think about how to reduce this burden, possibly through a more automated or abstracted approach, or through making the transition itself easier.
+> 
+> 
+> **Exploring Hijacking Options**
+> 
+> I'm now diving deeper into the potential of "hijacking" the original ProgID. It seems like a very direct approach, and I'm investigating methods to redirect the `CoCreateInstance` call to launch the wrapper service. The registry paths are critical here. I'm mentally mapping out potential adjustments within the registry.
+> 
+> 
+> **Considering Alternate Solutions**
+> 
+> I'm evaluating alternative strategies. While directly altering the registry seems the most tempting and direct path to the solution, I'm worried about the potential pitfalls. The invasiveness and fragility raise red flags. Now, I'm starting to consider other potential strategies, like modifying the initial calling method, or finding another method of changing the destination.
+> 
+> 
+> **Rethinking Entry Points**
+> 
+> I'm re-evaluating the role of the registry. Though hijacking seems direct, the risks are substantial. I'm exploring other ways to alter the entry point without solely relying on overwriting the registry keys. Maybe there's a pre- or post-call hook available, or some form of proxy-based solution. The goal is still to make the transition as seamless as possible for the client.
+> 
+> 
+> **Analyzing the Registry Approach**
+> 
+> I'm now diving deep into the "hijack" method, as I see it as the most direct path, but I am also increasingly worried about the fragility inherent in registry modifications, especially with the existing potential for third-party software to intervene. I must address this issue by exploring mitigation techniques. I need a solid plan for uninstalling and restoring.
+> 
+> 
+> **Refining Registry Modifications**
+> 
+> I'm now focused on the specifics of the registry modification, particularly on altering the `LocalServer32` key. I am exploring the different ways to modify registry keys, especially with regard to security and permissions. The goal is to ensure a solid, reliable process to reduce the fragility inherent in this solution, while also exploring how to mitigate the risk associated with the modification itself.
+> 
+> 
+> **Mapping the Risks**
+> 
+> I'm now completely focused on the potential problems associated with the registry modification solution. The fragility concerns are paramount. The issues of install and uninstall need thorough consideration. Debugging complications are on my radar too. I need to weigh all the potential downsides to deliver a responsible recommendation.
+> 
+> 
+> **Defining the "How To"**
+> 
+> I'm mapping out the detailed steps for modifying the registry and building out the code. I'll show how to locate the original CLSID, how to replace it, and the importance of a robust uninstall. I'm also building examples of how the wrapper service will actually work, and clarifying how the new service will be launched.
+> 
+> 
+This is the single most critical question in this entire architecture, and you have hit upon the fundamental drawback of the wrapper pattern. You are correct: if clients are hard-coded to call `new TargetComObject()` (which uses `Target.ProgID`), they will not know to call `new MyCompany.ServiceWrapper()` instead.
+
+There is a workaround, but it is an advanced and potentially dangerous technique that should be used with extreme caution. It involves intentionally modifying the Windows Registry to "hijack" the original ProgID.
+
+This is the **only way** to achieve your goal without changing any client code.
+
+### The Solution: The Registry Hijack
+
+The core idea is to change the registry so that when any application asks COM for `Target.ProgID`, COM is redirected and launches your wrapper service instead of the original executable.
+
+Here is the chain of events in the registry that COM follows:
+1.  A client calls `CoCreateInstance` with `Target.ProgID`.
+2.  COM looks up `HKEY_CLASSES_ROOT\Target.ProgID\CLSID`.
+3.  This key contains a **CLSID** (a GUID, like `{...}`).
+4.  COM then looks up `HKEY_CLASSES_ROOT\CLSID\<The_CLSID>\LocalServer32`.
+5.  This key points to the path of the executable to launch.
+
+The hijack involves changing the value in **Step 3**. You will tell COM that `Target.ProgID` now resolves to *your wrapper's CLSID*.
+
+---
+
+### Step-by-Step Implementation
+
+#### Step 1: Find the CLSIDs
+
+You need two pieces of information:
+1.  **The Wrapper's CLSID:** This is the `Guid` you defined in your wrapper's C# code. Let's say it's `{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}`.
+2.  **The Original Target's CLSID:** You can find this by looking in the registry.
+    *   Open `regedit`.
+    *   Navigate to `HKEY_CLASSES_ROOT\Target.ProgID\CLSID`.
+    *   The `(Default)` value is the original CLSID. Let's say it's `{BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB}`.
+
+#### Step 2: Create a Robust Installer/Uninstaller
+
+You **must not** perform this registry change manually. It must be done by an installer (e.g., WiX, Inno Setup, or even a custom C# utility) that can also reliably undo it.
+
+**Installer Logic:**
+1.  **Backup:** Read the original CLSID from `HKEY_CLASSES_ROOT\Target.ProgID\CLSID` and save it to a safe location (e.g., another registry key owned by your application or a file).
+2.  **Hijack:** Overwrite the `(Default)` value at `HKEY_CLASSES_ROOT\Target.ProgID\CLSID` with your wrapper's CLSID (`{AAAAAAAA-...}`).
+3.  **Register:** Ensure your wrapper service `.exe` is properly registered with COM so that its own CLSID (`{AAAAAAAA-...}`) points to its executable path. The `regasm.exe` tool handles this (`regasm MyWrapperService.exe /codebase`).
+
+**Uninstaller Logic:**
+1.  **Restore:** Read the backed-up original CLSID (`{BBBBBBBB-...}`).
+2.  Write this value back to `HKEY_CLASSES_ROOT\Target.ProgID\CLSID`.
+3.  **Unregister:** Unregister your wrapper service (`regasm /unregister MyWrapperService.exe`).
+
+#### Step 3: Modify the Wrapper Service Logic
+
+Your service logic must now change slightly. It no longer needs to register itself in the Running Object Table (ROT) because COM will now launch it directly. The goal is simply to start the service and have it instantiate the *real* target object, keeping it alive.
+
+```csharp
+using System.ServiceProcess;
+using System.Runtime.InteropServices;
+
+public partial class MyHijackService : ServiceBase
+{
+    private object _targetComObject;
+
+    public MyHijackService()
+    {
+        InitializeComponent();
+    }
+
+    protected override void OnStart(string[] args)
+    {
+        try
+        {
+            // IMPORTANT: We need the REAL ProgID of the target now.
+            // We can't use "Target.ProgID" because that would create a circular dependency
+            // where we try to launch ourselves!
+            // You must find the real object's ProgID if it has another one,
+            // or instantiate it by its CLSID.
+            
+            // Best method: Instantiate the REAL object by its CLSID.
+            Guid realClsid = new Guid("{BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB}");
+            Type targetType = Type.GetTypeFromCLSID(realClsid);
+            
+            // Create and hold the instance. This keeps the target .exe alive.
+            _targetComObject = Activator.CreateInstance(targetType);
+
+            // The service is now running and holding the object.
+            // We don't need the ROT because we ARE the server now.
+            // The dynamic pass-through will be handled by COM itself
+            // if your wrapper class implements the target's interfaces.
+        }
+        catch (Exception ex)
+        {
+            this.EventLog.WriteEntry($"Service failed to start: {ex.Message}", System.Diagnostics.EventLogEntryType.Error);
+            this.Stop();
+        }
+    }
+
+    protected override void OnStop()
+    {
+        // Releasing the object allows the target .exe to shut down.
+        if (_targetComObject != null && Marshal.IsComObject(_targetComObject))
+        {
+            Marshal.ReleaseComObject(_targetComObject);
+        }
+        _targetComObject = null;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+}
+```In this scenario, your wrapper class would need to implement the target's interfaces directly (the strongly-typed approach), not the dynamic approach, for COM to correctly marshal the calls.
+
+---
+
+### **CRITICAL WARNINGS** - Why This Is Dangerous
+
+This is a powerful but brittle solution. You must understand the risks before proceeding.
+
+1.  **Fragility:** If the original application is repaired, updated, or reinstalled, its own installer will likely "fix" the registry, overwriting your hijack and breaking your service. You would need to re-run your installer's "hijack" step.
+2.  **Installation Complexity:** Your installer and uninstaller **must be perfect**. If your uninstaller fails to restore the original CLSID, you will have permanently broken the target application.
+3.  **Debugging Nightmare:** This creates "spooky action at a distance." A developer looking at client code will see it calling `Target.ProgID`, but your wrapper process will launch. This can make debugging extremely confusing.
+4.  **Security Scanners:** Modifying another application's core registry keys is behavior that can be flagged as suspicious or malicious by security and antivirus software.
+
+### The Architecturally Cleaner (but different) Alternative: A Factory
+
+If you have any ability to change the client code, a much cleaner pattern is to introduce a "Factory."
+
+1.  **Service:** Your wrapper service runs, instantiates the target COM object, and registers it in the ROT using its own unique ProgID (`MyCompany.ServiceWrapper`).
+2.  **Factory:** You create a second, extremely lightweight COM object called `MyCompany.Factory`.
+3.  **Client Change:** You change the client code **once** to call the factory instead of the target.
+    ```csharp
+    // Old code:
+    // var myObj = new TargetComObject();
+
+    // New code:
+    var factory = new MyCompany.Factory();
+    var myObj = factory.GetTargetObject();
+    ```
+4.  **Factory Logic:** The `GetTargetObject()` method is simple: it calls `GetObject("MyCompany.ServiceWrapper")` to connect to your running service via the ROT and returns the object instance to the client.
+
+This avoids the registry hijack completely, making it far more robust and maintainable, but it does not meet the strict requirement of "zero client code changes."
