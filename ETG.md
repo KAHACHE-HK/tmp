@@ -795,3 +795,291 @@ try
 | **`Activator.CreateInstance`**    | **Simpler code.** A single line handles finding, launching, and connecting. Doesn't require knowing the `.exe` path (COM finds it via the registry). | **Less control.** You don't get the `Process` object directly. If you need to kill the process on shutdown, you'd have to find it by its name, which is less reliable than having the `Process` object from the start. |
 
 For a Windows Service, the explicit control offered by `Process.Start` is generally preferable.
+*Thinking...*
+
+> **Analyzing the Core Request**
+> 
+> I've zeroed in on the critical distinction: the user needs a *real* Windows Service, not just a console app masquerading as one. My primary task is to move the existing proxy logic into this service structure. This is the bedrock upon which I am building the detailed C# solution.
+> 
+> 
+> **Structuring Service Implementation**
+> 
+> I'm now fleshing out the architecture: the service will need a thread within the `OnStart()` method. This thread will be responsible for managing the proxy. I'm designing the thread's operation and considering the best way to handle communication and any necessary state. Error handling and logging, of course, is integral to this.
+> 
+> 
+> **Outlining Service Structure**
+> 
+> I'm now delineating the essential aspects for the service's architecture. The `OnStart()` method's rapid return to the SCM is vital, necessitating a separate thread for proxy operation. I'm clarifying the thread's responsibility for managing the proxy's lifecycle, detailing requirements for robust logging, and addressing COM context considerations.
+> 
+> 
+> **Mapping the Code Implementation**
+> 
+> I'm now determining the best place to map the code, and its function. I'm focusing on key parts, such as the `OnStart()` method, and how it needs a new thread to avoid blocking the Service Control Manager.  Next, I plan on providing robust logging using the Windows Event Log, and address configuration considerations.
+> 
+> 
+> **Decomposing Implementation Details**
+> 
+> I'm now tackling the `Run` method within the service thread, which houses the primary proxy logic.  I'll encapsulate it with a `try-catch-finally` structure for error handling and ensure all `Console.WriteLine` calls are routed to the Event Log. I'm integrating configuration loading from `App.config` to make the executable path flexible.
+> 
+> 
+> **Mapping Implementation Steps**
+> 
+> I'm now focusing on arranging the detailed, step-by-step explanation to the user. I'll begin with an introduction that explains the core differences between console and Windows services, followed by instructions to create the service project in Visual Studio. Afterwards, I will address installing the service, showing how to use the Event Viewer to find the output.
+> 
+> 
+> **Planning the Code Structure**
+> 
+> I'm now considering how to present the code: I'll give detailed, commented code blocks for the core `ProxyService.cs`. This will include clear instructions on how to install and manage the service. Also, I'll provide exact App.config contents to emphasize configuration.
+> 
+> 
+Excellent point. You are absolutely correct. The previous examples used console applications for simplicity and to demonstrate the core logic. Hosting this proxy in a proper **Windows Service** is the correct way to deploy it in a real-world scenario.
+
+A Windows Service runs in the background, starts automatically with the computer (if configured to do so), and doesn't have a user interface or console window. This is perfect for our proxy.
+
+Let's convert the proxy project into a full-fledged, installable Windows Service. This involves several key changes:
+
+1.  **Project Type:** We need a "Windows Service" project.
+2.  **Service Lifecycle:** We'll use the `OnStart` and `OnStop` methods instead of `Main`.
+3.  **Threading:** The `OnStart` method must return quickly, so we'll run our main logic on a separate worker thread.
+4.  **Logging:** Services can't write to the console. We will use the **Windows Event Log**, which is the standard for services.
+5.  **Installation:** Services must be installed. We'll add an installer component and use the `installutil.exe` tool.
+6.  **Configuration:** We'll move the hard-coded path to the COM server into an `App.config` file.
+
+---
+
+### Step 1: Create a New Windows Service Project
+
+In Visual Studio, create a new project using the **Windows Service (.NET Framework)** template. Name it something like `ComProxyService`.
+
+Copy the `RotManager.cs` and `GenericComProxy.cs` files from the previous proxy project into this new project.
+
+### Step 2: Add the Service Installer
+
+A service needs an installer to register it with the Windows Service Control Manager.
+
+1.  Open the `ProxyService.cs` file in the designer view (it might be named `Service1.cs` by default; rename it).
+2.  Right-click on the design surface and select **Add Installer**.
+3.  This adds a `ProjectInstaller.cs` file containing two components: `serviceProcessInstaller1` and `serviceInstaller1`.
+4.  Select `serviceProcessInstaller1` and in the **Properties** window, change the **Account** to **LocalSystem**. This is a high-privilege account, crucial for tasks like ROT manipulation.
+5.  Select `serviceInstaller1`. In the **Properties** window, you can change:
+    *   **ServiceName:** `ComProxyService` (This is the name you'll use in commands like `net start`).
+    *   **DisplayName:** `COM Generic Proxy Service` (This is the friendly name you'll see in `services.msc`).
+    *   **StartType:** `Automatic` (So the service starts when Windows boots).
+
+### Step 3: Implement the Service Logic
+
+Now, replace the code in `ProxyService.cs` with the following. This code adapts our previous logic to the service lifecycle.
+
+**ProxyService.cs**
+```csharp
+using System;
+using System.Configuration;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.ServiceProcess;
+using System.Threading;
+
+namespace ComProxyService
+{
+    public partial class ProxyService : ServiceBase
+    {
+        private Thread _mainThread;
+        private ManualResetEvent _stopEvent = new ManualResetEvent(false);
+
+        private Process _serverProcess;
+        private object _realObject;
+        private int _proxyRotCookie;
+
+        public const string ProgId = "MyCompany.OriginalObject";
+
+        public ProxyService()
+        {
+            InitializeComponent();
+        }
+
+        protected override void OnStart(string[] args)
+        {
+            EventLog.WriteEntry("ComProxyService", "Service is starting.", EventLogEntryType.Information);
+
+            // The OnStart method must return, so we run our logic on a new thread.
+            _mainThread = new Thread(Run);
+            _mainThread.IsBackground = true;
+            _mainThread.Start();
+        }
+
+        protected override void OnStop()
+        {
+            EventLog.WriteEntry("ComProxyService", "Service is stopping.", EventLogEntryType.Information);
+
+            // Signal the worker thread to stop and wait for it to clean up.
+            _stopEvent.Set();
+            _mainThread.Join(TimeSpan.FromSeconds(10)); // Wait up to 10 seconds
+
+            // Final cleanup in case the thread is stuck
+            Cleanup();
+        }
+
+        /// <summary>
+        /// This is the main worker method that runs on a separate thread.
+        /// </summary>
+        private void Run()
+        {
+            try
+            {
+                // STEP 1: Get server path from config file
+                string serverExePath = ConfigurationManager.AppSettings["ServerExePath"];
+                if (string.IsNullOrEmpty(serverExePath) || !File.Exists(serverExePath))
+                {
+                    EventLog.WriteEntry("ComProxyService", $"FATAL: ServerExePath is invalid or not found in App.config. Path: '{serverExePath}'", EventLogEntryType.Error);
+                    return; // Stop the thread
+                }
+
+                // STEP 2: Launch the real COM server process
+                EventLog.WriteEntry("ComProxyService", $"Launching server process: {serverExePath}", EventLogEntryType.Information);
+                _serverProcess = Process.Start(serverExePath);
+
+                // STEP 3: Poll the ROT to find the object
+                EventLog.WriteEntry("ComProxyService", $"Waiting for '{ProgId}' to appear in the ROT.", EventLogEntryType.Information);
+                while (!_stopEvent.WaitOne(0)) // Loop as long as stop is not signaled
+                {
+                    if (_serverProcess.HasExited)
+                    {
+                        throw new InvalidOperationException("The COM server process exited prematurely.");
+                    }
+                    
+                    try
+                    {
+                        _realObject = Marshal.GetActiveObject(ProgId);
+                        if (_realObject != null)
+                        {
+                            EventLog.WriteEntry("ComProxyService", "Found real object in ROT. Proceeding with hijack.", EventLogEntryType.Information);
+                            break; // Exit the loop
+                        }
+                    }
+                    catch (COMException)
+                    {
+                        Thread.Sleep(1000); // Wait and retry
+                    }
+                }
+
+                if (_realObject != null)
+                {
+                    // STEP 4: Create and register our proxy
+                    var proxyInstance = new GenericComProxy(_realObject);
+                    _proxyRotCookie = RotManager.Register(proxyInstance, ProgId);
+                    EventLog.WriteEntry("ComProxyService", $"Proxy has hijacked '{ProgId}' in the ROT.", EventLogEntryType.SuccessAudit);
+                }
+
+                // STEP 5: Wait for the OnStop signal
+                _stopEvent.WaitOne();
+            }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry("ComProxyService", $"An unhandled exception occurred: {ex.Message}\n{ex.StackTrace}", EventLogEntryType.Error);
+            }
+            finally
+            {
+                Cleanup();
+            }
+        }
+
+        /// <summary>
+        /// Centralized cleanup logic.
+        /// </summary>
+        private void Cleanup()
+        {
+            // Revoke our proxy from the ROT
+            if (_proxyRotCookie != 0)
+            {
+                try
+                {
+                    RotManager.Revoke(_proxyRotCookie);
+                    EventLog.WriteEntry("ComProxyService", "Proxy revoked from ROT.", EventLogEntryType.Information);
+                }
+                catch (Exception ex) { EventLog.WriteEntry("ComProxyService", $"Error revoking ROT entry: {ex.Message}", EventLogEntryType.Warning); }
+                _proxyRotCookie = 0;
+            }
+
+            // Release the COM object reference
+            if (_realObject != null && Marshal.IsComObject(_realObject))
+            {
+                Marshal.ReleaseComObject(_realObject);
+                _realObject = null;
+            }
+
+            // Terminate the server process that we started
+            if (_serverProcess != null && !_serverProcess.HasExited)
+            {
+                try
+                {
+                    _serverProcess.Kill();
+                    _serverProcess.WaitForExit();
+                    EventLog.WriteEntry("ComProxyService", "Server process terminated.", EventLogEntryType.Information);
+                }
+                catch (Exception ex) { EventLog.WriteEntry("ComProxyService", $"Error killing server process: {ex.Message}", EventLogEntryType.Warning); }
+            }
+            if (_serverProcess != null)
+            {
+                _serverProcess.Dispose();
+                _serverProcess = null;
+            }
+        }
+    }
+}
+```
+
+### Step 4: Add Configuration File
+
+Right-click your `ComProxyService` project, select **Add > New Item**, and choose **Application Configuration File**. It will be named `App.config`. Paste the following content into it, **making sure to update the path**.
+
+**App.config**
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<configuration>
+    <startup> 
+        <supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.7.2" />
+    </startup>
+    <appSettings>
+        <!-- IMPORTANT: Update this value to the full path of your OriginalComServer.exe -->
+        <add key="ServerExePath" value="C:\path\to\your\projects\OriginalComServer\bin\Debug\OriginalComServer.exe" />
+    </appSettings>
+</configuration>
+```
+You will also need to add a reference to `System.Configuration` to your project to use `ConfigurationManager`.
+
+### Step 5: How to Install and Run the Service
+
+1.  **Build the Solution:** Build the `ComProxyService` project in `Release` mode.
+2.  **Open Admin Command Prompt:** You must use the **Developer Command Prompt for VS** and run it **as Administrator**.
+3.  **Navigate to the Output Directory:** Use `cd` to navigate to the `bin\Release` folder of your service project.
+    ```
+    cd C:\path\to\your\projects\ComProxyService\bin\Release
+    ```
+4.  **Install the Service:** Use the `installutil.exe` tool.
+    ```
+    installutil.exe ComProxyService.exe
+    ```
+    If successful, you will see a confirmation that the installation has completed.
+5.  **Start the Service:** You can now start the service in one of two ways:
+    *   **Via Services App:** Open `services.msc`, find "COM Generic Proxy Service" in the list, right-click, and select **Start**.
+    *   **Via Command Line:** `net start ComProxyService`
+
+### Step 6: How to Check Output and Test
+
+Since there is no console, all output goes to the Windows Event Log.
+
+1.  Open **Event Viewer** (run `eventvwr.msc`).
+2.  Navigate to **Windows Logs > Application**.
+3.  Look for events with the **Source** set to `ComProxyService`. You will see the "Service is starting," "Launching server," and "Proxy has hijacked" messages.
+
+Now, with the service running, you can run your `Client.exe` application. It will work exactly as before, but now its requests are being proxied by a robust, background Windows Service.
+
+### To Uninstall the Service
+
+When you need to update the service or remove it, you must first stop it and then uninstall it from the same admin command prompt:
+
+```
+net stop ComProxyService
+installutil.exe /u ComProxyService.exe
+```
