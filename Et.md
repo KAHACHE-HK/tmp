@@ -606,3 +606,264 @@ public partial class MyService : ServiceBase
 Exposing a Windows Service as a COM object simultaneously **is possible and is the correct way to do it within a single process**. The **Running Object Table (ROT)** is the mechanism that makes this work by allowing the service to register its active COM object for clients to find.
 
 However, due to the increased complexity and tighter coupling, this method should be chosen when performance is critical and the overhead of a second process is unacceptable. For many scenarios, the **Broker Pattern** remains a simpler, more robust, and more maintainable solution.
+*Thinking...*
+
+> **Considering User Needs**
+> 
+> I'm now focused on dissecting the user's core objective: seamless COM call forwarding via a wrapper. The real challenge lies in the "dynamic" aspect - avoiding pre-defined function/argument mappings. This implies a need for reflection or some form of late binding at the wrapper level. I'm starting to picture how this might work, considering different technologies that can support such runtime behavior.
+> 
+> 
+> **Framing Dynamic Invocation**
+> 
+> I'm currently visualizing the solution's structure. It's shaping up to be a .NET wrapper using `DynamicObject` to handle COM calls. The core will revolve around intercepting calls via `TryInvokeMember`, then using reflection via `InvokeMember` to forward them to the target COM object, after retrieving the IDispatch interface. This seems to neatly fulfill the dynamic requirement.
+> 
+> 
+> **Elaborating Implementation Details**
+> 
+> I'm now sketching out the detailed implementation, concentrating on the critical `DynamicComWrapper` class. The goal is to make it inherit from `DynamicObject` for dynamic behavior. Within the wrapper, I envision using `IDispatch` through its interface for communication with the COM object. The plan involves using `TryInvokeMember` to intercept the client calls. Then, it involves a mapping or discovery mechanism for COM methods to find, followed by invoking the target COM object through reflection on the COM object.
+> 
+> 
+> **Mapping Member Calls**
+> 
+> I'm now focusing on handling the complexities of argument passing and return types within `InvokeMember`. This involves looking into how to handle different COM data types, including marshaling to ensure compatibility between .NET and COM. Also, I'm thinking about managing exceptions that might arise during the COM invocation process and propagating the appropriate error information.
+> 
+> 
+> **Outlining the Wrapper Structure**
+> 
+> I'm now clarifying the architectural components. The core will be a `.NET` wrapper leveraging `DynamicObject` to handle calls. Within `TryInvokeMember`, I plan on using `InvokeMember` to dynamically invoke methods on the COM object, once its `IDispatch` has been retrieved and saved for each call. This should allow for flexible call forwarding to COM.
+> 
+> 
+> **Outlining the Solution**
+> 
+> I'm now in the process of building a comprehensive answer. The structure of my response will start with a clear, affirmative statement about the feasibility, followed by introducing `IDispatch` and `DynamicObject` as the core technologies. I will next offer a high-level overview of the strategy, which includes a step-by-step guide to implement a `DynamicComWrapper` class that effectively uses reflection to forward COM calls dynamically. The final part will include practical code examples, so the user can get a workable solution.
+> 
+> 
+> **Detailing the Steps**
+> 
+> I'm now translating the implementation strategy into actionable steps. It involves crafting the `DynamicComWrapper` class with `DynamicObject`, and highlighting its crucial role. I'm mapping `TryInvokeMember` to the `InvokeMember` method of the COM object's type, while noting the importance of handling return values and exceptions.
+> 
+> 
+> **Formulating a Complete Answer**
+> 
+> I'm now solidifying the approach. It's essential to structure my response with a clear "yes, this is possible" followed by a practical code sample. The aim is a step-by-step guide for the `DynamicComWrapper` class using reflection. A vital aspect will be demonstrating the wrapper's use with a VBScript example. Finally, a pros and cons summary will assist the user with their decision-making process.
+> 
+> 
+This is a fantastic and advanced question. You are asking how to create a truly generic, future-proof wrapper that doesn't need to be recompiled every time the target COM object's interface changes.
+
+The answer is **yes, this is possible** by leveraging the dynamic capabilities of both COM and the .NET Framework.
+
+The core technologies you will use are:
+
+1.  **`IDispatch`:** The classic COM interface for late binding. It allows clients to invoke methods by name (as a string) at runtime, rather than by a fixed function pointer at compile time. Scripting languages like VBScript rely on this entirely.
+2.  **`System.Dynamic.DynamicObject`:** A .NET class that allows you to intercept operations on an object (like method calls and property access) that are not defined at compile time.
+3.  **.NET Reflection:** The mechanism to invoke members on an object using their string names.
+
+By combining these, you can create a wrapper that is essentially a "black box" pass-through. It receives a dynamic call from a client via `IDispatch` and dynamically forwards that exact same call to the target COM object.
+
+### The Strategy: The Dynamic Pass-Through Broker
+
+1.  Your wrapper service will expose a special COM object that inherits from `DynamicObject`.
+2.  When a client calls a method on your wrapper (e.g., `wrapper.GetData(123)`), the .NET DLR (Dynamic Language Runtime) will intercept this call and trigger the `TryInvokeMember` method on your `DynamicObject`.
+3.  Inside `TryInvokeMember`, you will receive the method name ("GetData") and the arguments (`{123}`).
+4.  You will then use .NET Reflection (`GetType().InvokeMember`) to call the method with that same name and arguments on the *real* target COM object that your wrapper is holding.
+5.  You will take the result from the target object and return it to the client.
+
+This process is completely dynamic. Your wrapper code never needs to know the names or signatures of the methods being called.
+
+### Implementation: Creating the Dynamic Wrapper
+
+Here is the complete code for this advanced wrapper.
+
+#### Step 1: The `DynamicComWrapper` Class
+
+This is the heart of the solution. It inherits from `DynamicObject` and overrides the methods that intercept calls.
+
+```csharp
+using System;
+using System.Dynamic;
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+[ComVisible(true)]
+[Guid("YOUR-DYNAMIC-WRAPPER-GUID-HERE")] // Generate a new GUID
+[ProgId("MyCompany.DynamicServiceWrapper")]
+public class DynamicComWrapper : DynamicObject
+{
+    private readonly object _targetComObject;
+
+    /// <summary>
+    /// Creates a dynamic wrapper around a target COM object.
+    /// </summary>
+    /// <param name="target">The COM object instance to wrap.</param>
+    public DynamicComWrapper(object target)
+    {
+        _targetComObject = target;
+    }
+
+    /// <summary>
+    /// Intercepts method calls.
+    /// </summary>
+    public override bool TryInvokeMember(InvokeMemberBinder binder, object[] args, out object result)
+    {
+        try
+        {
+            // Use reflection to invoke the same method on the real COM object.
+            result = _targetComObject.GetType().InvokeMember(
+                binder.Name,
+                BindingFlags.InvokeMethod,
+                null,
+                _targetComObject,
+                args);
+
+            return true; // Indicate success
+        }
+        catch (Exception ex)
+        {
+            // Unwrap the real exception from the reflection call
+            result = ex.InnerException?.Message ?? ex.Message;
+            return false; // Indicate failure
+        }
+    }
+
+    /// <summary>
+    /// Intercepts property 'get' access.
+    /// </summary>
+    public override bool TryGetMember(GetMemberBinder binder, out object result)
+    {
+        try
+        {
+            result = _targetComObject.GetType().InvokeMember(
+                binder.Name,
+                BindingFlags.GetProperty,
+                null,
+                _targetComObject,
+                null);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            result = ex.InnerException?.Message ?? ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Intercepts property 'set' access.
+    /// </summary>
+    public override bool TrySetMember(SetMemberBinder binder, object value)
+    {
+        try
+        {
+            _targetComObject.GetType().InvokeMember(
+                binder.Name,
+                BindingFlags.SetProperty,
+                null,
+                _targetComObject,
+                new object[] { value });
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Ensures the underlying COM object is released when the wrapper is garbage collected.
+    /// </summary>
+    ~DynamicComWrapper()
+    {
+        if (_targetComObject != null && Marshal.IsComObject(_targetComObject))
+        {
+            Marshal.ReleaseComObject(_targetComObject);
+        }
+    }
+}
+```
+
+#### Step 2: Integrate into the Windows Service
+
+Your service code now becomes simpler. It doesn't need to know anything about the target's interfaces.
+
+```csharp
+using System;
+using System.ServiceProcess;
+using System.Runtime.InteropServices;
+
+public partial class MyWrapperService : ServiceBase
+{
+    private DynamicComWrapper _dynamicWrapper;
+    private uint _rotRegistrationId;
+
+    public MyWrapperService()
+    {
+        InitializeComponent();
+    }
+
+    protected override void OnStart(string[] args)
+    {
+        try
+        {
+            // 1. Get the Type from the target executable's ProgID.
+            Type targetType = Type.GetTypeFromProgID("Target.ProgID"); // IMPORTANT: Use the real ProgID
+            if (targetType == null)
+            {
+                throw new InvalidOperationException("Could not find ProgID 'Target.ProgID'. Is the COM server registered?");
+            }
+
+            // 2. Create an instance of the real COM object.
+            object targetComObject = Activator.CreateInstance(targetType);
+
+            // 3. Create our dynamic wrapper around it.
+            _dynamicWrapper = new DynamicComWrapper(targetComObject);
+
+            // 4. Register our dynamic wrapper in the ROT.
+            //    Clients will connect to this wrapper.
+            _rotRegistrationId = ComRegistration.Register(_dynamicWrapper);
+        }
+        catch (Exception ex)
+        {
+            this.EventLog.WriteEntry($"Service failed to start: {ex.Message}", System.Diagnostics.EventLogEntryType.Error);
+            this.Stop();
+        }
+    }
+
+    protected override void OnStop()
+    {
+        if (_rotRegistrationId != 0)
+        {
+            ComRegistration.Revoke(_rotRegistrationId);
+        }
+        _dynamicWrapper = null;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+}
+
+// You must also include the ComRegistration helper class from the previous answers
+// that contains the P/Invoke calls for RegisterActiveObject and RevokeActiveObject.
+```
+
+### How Clients Use It
+
+A client (like VBScript, which is perfect for demonstrating this) would look like this. Notice it's connecting to the wrapper's `ProgID`.
+
+**test_client.vbs:**
+```vbscript
+' Connect to our dynamic wrapper service
+Set wrapper = GetObject("MyCompany.DynamicServiceWrapper")
+
+' Now, call methods as if we were talking to the REAL object.
+' The wrapper code doesn't know about "GetData" or "PerformAction",
+' but it will pass the calls through dynamically.
+
+On Error Resume Next
+
+' Call a method
+result = wrapper.GetData(42)
+If Err.Number <> 0 Then
+    WScript.Echo "Error calling GetData: " & Err.Description
+Else
+    WScript.Echo "Result from GetData(42): "
