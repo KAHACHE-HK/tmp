@@ -1044,3 +1044,311 @@ If you have any ability to change the client code, a much cleaner pattern is to 
 4.  **Factory Logic:** The `GetTargetObject()` method is simple: it calls `GetObject("MyCompany.ServiceWrapper")` to connect to your running service via the ROT and returns the object instance to the client.
 
 This avoids the registry hijack completely, making it far more robust and maintainable, but it does not meet the strict requirement of "zero client code changes."
+*Thinking...*
+
+> **Defining the Core Goal**
+> 
+> I'm beginning to dissect the user's need: a batch file replacing a C# installer. My focus is now on converting the C# logic into the language of command-line instructions. The initial step is to identify the core tasks that need to be translated from C# to batch.
+> 
+> 
+> **Translating Core Tasks**
+> 
+> I've moved beyond just identifying the main functions. I'm now wrestling with the specifics of each command, ensuring I have a solid understanding of how to use `regasm.exe`, `sc.exe`, and `reg.exe` in the context of installing and uninstalling a .NET COM server as a Windows service. Specifically, I need to determine the correct syntax for these tools to handle COM registration, service creation/deletion, and the crucial registry manipulation, including backups and restores.
+> 
+> 
+> **Planning Registry Manipulation**
+> 
+> I'm now deep into the specifics of registry backups and restores. The `reg` command will be crucial here, especially for backing up and restoring the `CurVer` and `CLSID` keys. I'm exploring how to use `reg export` to capture the registry state before modification and `reg import` to restore it. Also, I am working out the syntax to correctly create/delete registry keys and set their values, considering that I'll need to work with both the registry's default and advanced paths.
+> 
+> 
+> **Implementing the Admin Check**
+> 
+> I'm now focused on the Admin check. I'm planning to utilize `net session >nul 2>&1` for its simplicity and reliability. Then, based on the `errorlevel`, I'll design the script to either proceed or display an error message, ensuring the script only runs when elevated. I've also started to consider ways to handle errors and provide better user feedback at various stages of execution.
+> 
+> 
+> **Structuring the Registry Operations**
+> 
+> I'm now focused on the delicate operation of registry backup and restore, using a text file to store the original value and type of the registry key. I will use `reg query` and then parsing the output using a `for /f` loop to capture key values, and subsequently, store this in the backup file. Then, I'll work on deleting `CurVer` and creating/setting `CLSID`, making use of the `/f` flag to force deletion. Finally, I will incorporate the process to restore the information I backed up earlier, when the user requests that operation.
+> 
+> 
+> **Scripting the Backup Process**
+> 
+> I'm now developing the detailed logic for the registry backup. Specifically, I'm preparing to create the `backup.reg.txt` file. It will store the value and the key name of the registry entries to be modified. Using a `for /f` loop, I will capture and parse the registry output to store the original value. Also, I will be including the logic to restore all the backed up keys when an uninstall request occurs.
+> 
+> 
+> **Implementing the Registry Logic**
+> 
+> I'm now focusing on the backup, deletion, and restoration of the registry entries. I plan to start by determining if `CurVer` exists, and, if not, if `CLSID` exists. Then, I will use `reg query` combined with `for /f` loops to capture and parse the registry key and its value. The goal is to store the original state in a backup file, which can later be used in an uninstallation.
+> 
+> 
+Of course. Using a batch file is a classic and powerful way to handle this kind of installation, as it has no dependencies other than the Windows operating system itself.
+
+This batch script is designed to be a complete, robust replacement for the C# installer. It handles:
+*   Administrator privilege checking.
+*   Command-line arguments (`install`/`uninstall`).
+*   Backing up the original registry settings to a file.
+*   Correctly handling both `CurVer` and direct `CLSID` ProgIDs.
+*   Cleaning up after itself.
+
+### The Batch File: `install_wrapper.bat`
+
+Save this code as `install_wrapper.bat` in the **same directory** as your `GenericHijackService.exe`.
+
+```batch
+@echo off
+setlocal
+
+:: ============================================================================
+:: --- CONFIGURATION ---
+:: ============================================================================
+:: The name you will use for the Windows Service.
+set "ServiceName=MyGenericComWrapperService"
+
+:: The filename of your service executable.
+set "ServiceExecutableName=GenericHijackService.exe"
+
+:: The FIXED, COMPILED-IN GUID of your DynamicHijackWrapper class.
+set "WrapperClsid={AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}"
+
+:: The path to the 64-bit .NET Framework v4 regasm.exe.
+:: Adjust this path if you are on a 32-bit system or targeting a different framework.
+set "RegasmPath=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\regasm.exe"
+
+:: The name of the file used to back up registry settings.
+set "BackupFile=hijack_backup.dat"
+
+
+:: ============================================================================
+:: --- SCRIPT LOGIC ---
+:: ============================================================================
+
+:: 1. Check for Administrator Privileges
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo.
+    echo ERROR: This script requires Administrator privileges.
+    echo Please right-click and select "Run as administrator".
+    echo.
+    goto :end
+)
+
+:: 2. Check Arguments
+if /i "%~1" neq "install" if /i "%~1" neq "uninstall" goto :usage
+if "%~2" equ "" goto :usage
+
+set "Command=%~1"
+set "TargetProgID=%~2"
+set "ServiceExePath=%~dp0%ServiceExecutableName%"
+
+if not exist "%ServiceExePath%" (
+    echo ERROR: The service executable was not found at:
+    echo %ServiceExePath%
+    goto :end
+)
+
+if /i "%Command%" equ "install" goto :install
+if /i "%Command%" equ "uninstall" goto :uninstall
+goto :end
+
+
+:: ============================================================================
+:: --- INSTALL SUBROUTINE ---
+:: ============================================================================
+:install
+echo.
+echo --- Installing COM Hijack Service for '%TargetProgID%' ---
+echo.
+
+:: Step 1: Register the .NET assembly for COM Interop
+echo [1/4] Registering the wrapper assembly for COM...
+"%RegasmPath%" "%ServiceExePath%" /codebase
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to register the COM assembly.
+    goto :end
+)
+
+:: Step 2: Backup original registry settings
+echo [2/4] Backing up original COM registry settings...
+call :backupRegistry %TargetProgID%
+if %errorlevel% neq 0 goto :end
+
+:: Step 3: Hijack the version-independent ProgID
+echo [3/4] Hijacking the ProgID...
+call :hijackRegistry %TargetProgID%
+if %errorlevel% neq 0 goto :end
+
+:: Step 4: Create the Windows Service
+echo [4/4] Creating the Windows Service...
+set "BinPathArgument=\"%ServiceExePath%\" %TargetProgID%"
+sc.exe create "%ServiceName%" binPath= "%BinPathArgument%" start= auto >nul
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to create the Windows service.
+    goto :end
+)
+
+echo.
+echo --- Installation successful! ---
+echo Service '%ServiceName%' has been created.
+echo To start it, run: sc start "%ServiceName%"
+echo.
+goto :end
+
+
+:: ============================================================================
+:: --- UNINSTALL SUBROUTINE ---
+:: ============================================================================
+:uninstall
+echo.
+echo --- Uninstalling COM Hijack Service for '%TargetProgID%' ---
+echo.
+
+:: Step 1: Stop and Delete the Windows Service
+echo [1/3] Stopping and deleting the Windows Service...
+sc.exe stop "%ServiceName%" >nul 2>&1
+sc.exe delete "%ServiceName%" >nul
+if %errorlevel% neq 0 (
+    echo      Warning: Could not delete the service. It may already be removed.
+)
+
+:: Step 2: Restore original registry settings
+echo [2/3] Restoring original COM registry settings...
+call :restoreRegistry %TargetProgID%
+
+:: Step 3: Unregister the .NET assembly from COM
+echo [3/3] Unregistering the wrapper assembly from COM...
+"%RegasmPath%" /u "%ServiceExePath%" >nul
+if %errorlevel% neq 0 (
+    echo      Warning: Failed to unregister the COM assembly.
+)
+
+echo.
+echo --- Uninstallation successful! ---
+echo.
+goto :end
+
+
+:: ============================================================================
+:: --- HELPER FUNCTIONS ---
+:: ============================================================================
+
+:backupRegistry
+set "ProgIdKey=HKCR\%~1"
+set "OriginalType="
+set "OriginalValue="
+
+:: Check for CurVer first (version-independent ProgID)
+reg query "%ProgIdKey%\CurVer" /v "" >nul 2>&1
+if %errorlevel% equ 0 (
+    for /f "tokens=3" %%a in ('reg query "%ProgIdKey%\CurVer" /v ""') do set "OriginalValue=%%a"
+    set "OriginalType=CurVer"
+    echo      Found 'CurVer' key. Backing up value: %OriginalValue%
+    goto :writeBackup
+)
+
+:: If not, check for a direct CLSID (simple ProgID)
+reg query "%ProgIdKey%\CLSID" /v "" >nul 2>&1
+if %errorlevel% equ 0 (
+    for /f "tokens=3" %%a in ('reg query "%ProgIdKey%\CLSID" /v ""') do set "OriginalValue=%%a"
+    set "OriginalType=CLSID"
+    echo      Found 'CLSID' key. Backing up value: %OriginalValue%
+    goto :writeBackup
+)
+
+echo ERROR: The ProgID '%~1' has neither a 'CurVer' nor a 'CLSID' subkey.
+exit /b 1
+
+:writeBackup
+(
+    echo OriginalType=%OriginalType%
+    echo OriginalValue=%OriginalValue%
+) > "%~dp0%BackupFile%"
+exit /b 0
+
+
+:hijackRegistry
+set "ProgIdKey=HKCR\%~1"
+:: Delete the CurVer key to break the redirection chain.
+reg delete "%ProgIdKey%\CurVer" /f >nul 2>&1
+:: Create or overwrite the CLSID key to point to our wrapper.
+reg add "%ProgIdKey%\CLSID" /v "" /t REG_SZ /d "%WrapperClsid%" /f >nul
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to write hijack value to the registry.
+    exit /b 1
+)
+echo      Successfully set CLSID to point to wrapper: %WrapperClsid%
+exit /b 0
+
+
+:restoreRegistry
+set "ProgIdKey=HKCR\%~1"
+if not exist "%~dp0%BackupFile%" (
+    echo      Warning: Backup file not found. Cannot restore registry.
+    exit /b 0
+)
+
+:: Read variables from the backup file
+for /f "usebackq tokens=1,* delims==" %%a in ("%~dp0%BackupFile%") do set "%%a=%%b"
+
+if not defined OriginalType (
+    echo      Warning: Backup file is corrupt. Cannot restore.
+    exit /b 0
+)
+
+:: Delete our hijack key first
+reg delete "%ProgIdKey%\CLSID" /f >nul 2>&1
+
+:: Restore based on the backed-up type
+if /i "%OriginalType%" equ "CurVer" (
+    echo      Restoring original 'CurVer' key...
+    reg add "%ProgIdKey%\CurVer" /v "" /t REG_SZ /d "%OriginalValue%" /f >nul
+)
+if /i "%OriginalType%" equ "CLSID" (
+    echo      Restoring original 'CLSID' key...
+    reg add "%ProgIdKey%\CLSID" /v "" /t REG_SZ /d "%OriginalValue%" /f >nul
+)
+
+:: Clean up the backup file
+del "%~dp0%BackupFile%"
+exit /b 0
+
+
+:: ============================================================================
+:: --- USAGE AND END ---
+:: ============================================================================
+:usage
+echo.
+echo Manages the installation of a generic COM server hijack service.
+echo.
+echo Usage: %~nx0 [command] [ProgID]
+echo.
+echo Commands:
+echo   install      Installs the service and hijacks the specified ProgID.
+echo   uninstall    Removes the service and restores the original ProgID settings.
+echo.
+echo Example:
+echo   %~nx0 install SomeApp.Application
+echo   %~nx0 uninstall SomeApp.Application
+echo.
+goto :end
+
+:end
+endlocal
+exit /b %errorlevel%
+```
+
+### How to Use It
+
+1.  **Place Files:** Put `install_wrapper.bat` in the same folder as `GenericHijackService.exe`.
+2.  **Open Command Prompt as Administrator:** This is essential.
+3.  **Navigate:** `cd` to the directory containing the files.
+4.  **Run Commands:**
+    *   **To Install:**
+        ```
+        install_wrapper.bat install SomeApp.Application
+        ```
+    *   **To Uninstall:**
+        ```
+        install_wrapper.bat uninstall SomeApp.Application
+        ```
+
+The script will provide clear feedback at each step of the process.
