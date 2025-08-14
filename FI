@@ -1,0 +1,234 @@
+*Thinking...*
+
+> **Understanding the Serialization Task**
+> 
+> I'm currently breaking down the user's serialization request. The main focus is serializing a `HashMap<String, TypedData>`. My initial step involves understanding the structure, especially how `TypedData` will be handled, considering its multiple variants. I must determine how to make it efficient and flexible.
+> 
+> 
+> **Considering Contextual Serialization**
+> 
+> I'm now wrestling with the context problem. Serializing `TypedData` instances, especially the `Json` variant with potential compression, requires knowing other key-value pairs within the same `HashMap`. My initial `Serialize` implementation is self-contained, and the core challenge is providing the necessary context for decisions about decompression and JSON parsing.
+> 
+> 
+> **Exploring HashMap Context**
+> 
+> I'm now exploring the key challenge: the `TypedData`'s serializer lacks context from the `HashMap`. My initial thought involves modifying the data structure, such as adding a `compression` field directly to `TypedData`. However, this could force the user to refactor and the goal is to work within their existing structure. I'm now considering ways to inject the necessary context, potentially by creating a custom serializer at a higher level that has the entire `HashMap`.
+> 
+> 
+> **Devising a Container Strategy**
+> 
+> I'm now trying to create a custom serializer for the `HashMap` container. I'm designing `MyDataMap(HashMap<String, TypedData>)` to wrap the original. I'll implement `Serialize` on this wrapper to access the entire map and control the serialization process. My plan involves fetching the context (e.g., compression settings) before serializing each `TypedData` instance, which gives access to crucial context for decompression and JSON parsing.
+> 
+> 
+> **Developing the Serialization Plan**
+> 
+> I'm now evaluating the best method to use. The self-contained serialization approach for `TypedData` isn't sufficient, as it needs context. Modifying the data structure might not be an option. The custom serialization approach for the `HashMap` seems best; creating a wrapper struct, `MyDataMap`, is my next step.
+> 
+> 
+> **Defining the Wrapper Strategy**
+> 
+> I'm now establishing a robust method using a wrapper. A struct, `MyDataMap(HashMap<String, TypedData>)`, will wrap the original data. This wrapper, which implements `Serialize`, will give access to the entire `HashMap`, allowing me to handle contextual serialization correctly.
+> 
+> 
+> **Designing the Implementation Plan**
+> 
+> I'm now putting the pieces together and writing the implementation. The custom wrapper, `MyDataMap`, is key. I will implement `Serialize` on `MyDataMap` to handle the `HashMap` context. This will involve extracting the compression type and decompressing the data before serialization. I will include a helper function for decompression.
+> 
+> 
+> **Designing the Solution Implementation**
+> 
+> I'm now immersed in the practicalities of the implementation. The plan hinges on the `MyDataMap` wrapper, which gives access to the entire `HashMap`. I will handle the `Serialize` implementation, including decompressing the data if a `gzip` flag is present. I'll create the helper function for this and ensure the example works, which includes creating a compressed data example.
+> 
+> 
+> **Formulating a Plan**
+> 
+> I'm now summarizing the entire plan and what I need to do. First, I'll explain the serialization challenges, then introduce the wrapper approach, and lastly, I'll implement it, with a focus on the `Serialize` implementation. Including the `flate2` dependency and example data generation will make the solution runnable.
+> 
+> 
+Of course. This is an excellent question that highlights a common challenge in serialization: when the serialization of one piece of data depends on the value of another, sibling piece of data.
+
+The previous approach of implementing `impl Serialize for TypedData` will not work here. The `serialize` method for `TypedData` is only given a reference to the `TypedData` value itself (`&self`); it has no access to the surrounding `HashMap` to check for a `"compression"` key.
+
+The solution is to move the serialization logic up a level. Instead of customizing the serialization for the *value* (`TypedData`), you need to customize the serialization for the *container* (`HashMap`). The standard way to do this in Rust is to use the "newtype pattern"—creating a wrapper struct around the `HashMap` and implementing `Serialize` for that wrapper.
+
+This wrapper's `serialize` method will have access to the entire map, allowing it to:
+1.  Look for a `compression` field.
+2.  Use that information to process the `data` field.
+3.  Serialize the rest of the fields as usual.
+
+### Complete Rust Example with Conditional Decompression
+
+Here is a complete example that demonstrates this approach. We'll use the `flate2` crate for gzip compression and decompression.
+
+#### Project Setup
+
+First, add `flate2` to your `Cargo.toml` dependencies:
+
+```toml
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+flate2 = "1.0" # For gzip compression/decompression
+```
+
+#### Rust Code
+
+The following code defines the wrapper struct and implements the custom serialization logic.
+
+```rust
+use std::collections::HashMap;
+use std::io::Read;
+use serde::{Serialize, Serializer};
+use serde::ser::SerializeMap;
+use serde_json::Value;
+use flate2::read::GzDecoder;
+
+// The TypedData enum remains the same.
+// We don't need a custom Serialize impl for it anymore, so we can derive it.
+#[derive(Debug, Serialize)]
+pub enum TypedData {
+    String(String),
+    Integer(i32),
+    Json(Vec<u8>), // This will now hold raw bytes, possibly compressed
+}
+
+/// A wrapper struct around our HashMap to enable custom serialization logic.
+/// This is the "newtype pattern".
+pub struct ContextualMap<'a>(pub &'a HashMap<String, TypedData>);
+
+/// Helper function to decompress gzipped bytes.
+fn decompress_gzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decompressed_bytes = Vec::new();
+    decoder.read_to_end(&mut decompressed_bytes)?;
+    Ok(decompressed_bytes)
+}
+
+/// Custom serialization logic for our map wrapper.
+impl<'a> Serialize for ContextualMap<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // The inner map we are going to serialize.
+        let map = self.0;
+
+        // 1. First, inspect the map to find the context (the compression type).
+        let compression_type = match map.get("compression") {
+            Some(TypedData::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+
+        // Start serializing a map. We provide the length for efficiency.
+        let mut map_serializer = serializer.serialize_map(Some(map.len()))?;
+
+        // 2. Iterate through the map and serialize each key-value pair.
+        for (key, value) in map.iter() {
+            // We apply special logic for the "data" key.
+            if key == "data" {
+                if let TypedData::Json(bytes) = value {
+                    // Decide which bytes to parse based on the compression type.
+                    let bytes_to_parse = match compression_type {
+                        Some("gzip") => decompress_gzip(bytes)
+                            .map_err(serde::ser::Error::custom)?,
+                        // If no compression or unknown, use bytes as-is.
+                        _ => bytes.clone(),
+                    };
+
+                    // Parse the (potentially decompressed) bytes into a serde_json::Value.
+                    let nested_json: Value = serde_json::from_slice(&bytes_to_parse)
+                        .map_err(serde::ser::Error::custom)?;
+                    
+                    // Serialize the key and the parsed JSON value.
+                    map_serializer.serialize_entry(key, &nested_json)?;
+                } else {
+                    // If "data" is not TypedData::Json, serialize it normally.
+                    map_serializer.serialize_entry(key, value)?;
+                }
+            } else {
+                // 3. For all other keys, serialize them normally.
+                map_serializer.serialize_entry(key, value)?;
+            }
+        }
+
+        // Finalize the map serialization.
+        map_serializer.end()
+    }
+}
+
+fn main() {
+    // --- Create sample data ---
+    let mut data = HashMap::new();
+
+    // Add metadata fields.
+    data.insert(
+        "compression".to_string(),
+        TypedData::String("gzip".to_string()),
+    );
+    data.insert("source".to_string(), TypedData::String("device-123".to_string()));
+
+    // Create a nested JSON structure.
+    let nested_json_str = r#"{"temperature": 25.5, "status": "ok"}"#;
+
+    // Gzip compress the JSON string.
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(nested_json_str.as_bytes()).unwrap();
+    let compressed_json_bytes = encoder.finish().unwrap();
+
+    // Insert the compressed bytes into the map.
+    data.insert(
+        "data".to_string(),
+        TypedData::Json(compressed_json_bytes),
+    );
+
+    // --- Serialize using the wrapper ---
+
+    // Wrap the map in our custom serializable struct.
+    let serializable_map = ContextualMap(&data);
+
+    // Serialize the wrapper to a JSON string.
+    let serialized_json = serde_json::to_string_pretty(&serializable_map).unwrap();
+
+    // Print the result.
+    println!("Serialized Output:\n{}", serialized_json);
+
+    // --- Verification ---
+    let expected_output = r#"{
+  "compression": "gzip",
+  "source": "device-123",
+  "data": {
+    "temperature": 25.5,
+    "status": "ok"
+  }
+}"#;
+    
+    let expected_value: Value = serde_json::from_str(expected_output).unwrap();
+    let actual_value: Value = serde_json::from_str(&serialized_json).unwrap();
+
+    assert_eq!(expected_value, actual_value);
+    println!("\nSerialization successful and matches expected output.");
+}
+```
+
+### Explanation of the Key Concepts
+
+1.  **`ContextualMap` Wrapper Struct**:
+    *   This struct holds a reference to the `HashMap`. Its sole purpose is to provide a type that we can implement the `Serialize` trait on. This is necessary because Rust's orphan rule prevents you from implementing a foreign trait (`serde::Serialize`) for a foreign type (`std::collections::HashMap`).
+
+2.  **`impl<'a> Serialize for ContextualMap<'a>`**:
+    *   **Context Discovery**: The first thing the `serialize` method does is inspect the map to find the value associated with the `"compression"` key. This gives it the context needed for the rest of the operation.
+    *   **Manual Map Serialization**: It uses `serializer.serialize_map()` to gain full control over the serialization of the map's contents.
+    *   **Conditional Logic**: Inside the loop over the map's items, it checks if the current `key` is `"data"`.
+        *   If it is, it checks the `compression_type` found earlier.
+        *   If compression is `"gzip"`, it calls the `decompress_gzip` helper function.
+        *   It then parses the resulting bytes (either decompressed or raw) into a `serde_json::Value`.
+        *   Finally, it serializes this `Value` using `map_serializer.serialize_entry()`, which correctly nests the JSON object.
+    *   **Default Behavior**: For any key that is *not* `"data"`, it simply serializes the entry as-is with `map_serializer.serialize_entry(key, value)`. This ensures all other data is preserved in the output.
+    *   **Finalization**: `map_serializer.end()` must be called to complete the JSON object.
+
+### Key Takeaway
+
+The core principle is to **move the serialization logic from the individual value to a wrapper around the container**. This provides the necessary context to handle inter-field dependencies during serialization, allowing you to create sophisticated and flexible output formats.
