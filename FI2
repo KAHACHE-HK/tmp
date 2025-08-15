@@ -1,0 +1,126 @@
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
+use std::time::Duration;
+
+// This is our stand-in for the thread-unsafe library.
+struct UnsafeLibrary {
+    request_count: u32,
+}
+
+impl UnsafeLibrary {
+    fn new() -> Self {
+        UnsafeLibrary { request_count: 0 }
+    }
+
+    // A method that processes data and returns a result.
+    fn process_with_reply(&mut self, data: &str) -> String {
+        self.request_count += 1;
+        println!(
+            "[Library] Processing request #{}: '{}'",
+            self.request_count, data
+        );
+        thread::sleep(Duration::from_millis(1000)); // Simulate work
+        format!("Response to '{}'", data)
+    }
+    
+    // A method that doesn't need to return anything.
+    fn process_fire_and_forget(&mut self, data: &str) {
+        println!("[Library] Processing fire-and-forget message: '{}'", data);
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+// Define the type for the reply. Using a Result is good practice
+// to handle cases where the library operation could fail.
+type LibraryReply = Result<String, String>;
+
+// The command enum now includes a variant for requests that need a reply.
+// This variant carries a `Sender` for the reply channel.
+#[derive(Debug)]
+enum LibraryCommand {
+    ProcessWithReply {
+        data: String,
+        // The channel to send the reply back on.
+        responder: Sender<LibraryReply>,
+    },
+    ProcessFireAndForget(String),
+}
+
+fn main() {
+    // 1. Create the main MPSC channel for sending commands to the library.
+    let (command_tx, command_rx): (Sender<LibraryCommand>, Receiver<LibraryCommand>) = mpsc::channel();
+
+    // 2. Spawn the dedicated library thread.
+    let library_thread_handle = thread::spawn(move || {
+        // Create and own the library instance.
+        let mut library = UnsafeLibrary::new();
+        println!("[Library Thread] Started. Waiting for commands.");
+
+        // Loop over incoming commands.
+        for command in command_rx {
+            match command {
+                LibraryCommand::ProcessWithReply { data, responder } => {
+                    println!("[Library Thread] Received a request that requires a reply.");
+                    // Perform the work.
+                    let result = library.process_with_reply(&data);
+                    // Send the result back using the provided sender.
+                    // We use `Ok` to wrap the successful result.
+                    if let Err(e) = responder.send(Ok(result)) {
+                        // This error happens if the requesting thread has already hung up
+                        // and is no longer waiting for the reply. It's safe to ignore.
+                        eprintln!("[Library Thread] Failed to send reply: {}. The receiver was dropped.", e);
+                    }
+                }
+                LibraryCommand::ProcessFireAndForget(data) => {
+                    library.process_fire_and_forget(&data);
+                }
+            }
+        }
+    });
+
+    // --- Use the library from other threads ---
+
+    // Clone the main command sender for each thread.
+    let command_tx_clone = command_tx.clone();
+    let handle1 = thread::spawn(move || {
+        // 1. Create a one-shot channel for the reply.
+        let (reply_tx, reply_rx) = mpsc::channel::<LibraryReply>();
+
+        // 2. Create the command, including the sender for the reply.
+        let cmd = LibraryCommand::ProcessWithReply {
+            data: "Hello from thread 1".to_string(),
+            responder: reply_tx,
+        };
+
+        println!("[Thread 1] Sending request and waiting for reply...");
+        command_tx_clone.send(cmd).unwrap();
+
+        // 3. Block and wait for the reply.
+        // `recv()` will return an `Err` if the library thread panics before replying.
+        match reply_rx.recv() {
+            Ok(Ok(reply)) => println!("[Thread 1] Received reply: '{}'", reply),
+            Ok(Err(e)) => eprintln!("[Thread 1] Library returned an error: '{}'", e),
+            Err(e) => eprintln!("[Thread 1] Failed to receive reply: {}. Library thread may have crashed.", e),
+        }
+    });
+
+    let command_tx_clone2 = command_tx.clone();
+    let handle2 = thread::spawn(move || {
+        // This thread sends a "fire-and-forget" message.
+        println!("[Thread 2] Sending fire-and-forget message.");
+        let cmd = LibraryCommand::ProcessFireAndForget("A message with no reply needed".to_string());
+        command_tx_clone2.send(cmd).unwrap();
+    });
+
+    // Wait for the threads to finish.
+    handle1.join().unwrap();
+    handle2.join().unwrap();
+
+    // To gracefully shut down the library thread, drop the last sender.
+    // This will cause the `for command in command_rx` loop to terminate.
+    drop(command_tx);
+
+    // Wait for the library thread to shut down.
+    library_thread_handle.join().unwrap();
+    println!("[Main Thread] Program finished.");
+}
