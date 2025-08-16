@@ -1,0 +1,132 @@
+Here's a minimal function to parse HTTP headers from HAProxy's binary header format in Rust using the `httparse` crate:
+
+```rust
+use httparse;
+
+fn parse_haproxy_headers(hdrs_bin: &[u8]) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    // HAProxy typically sends headers in HTTP/1.x format
+    // The hdrs_bin should contain headers in the format:
+    // Header-Name: value\r\n
+    // Another-Header: value\r\n
+    // \r\n
+    
+    // Find the end of headers (double CRLF)
+    let headers_end = hdrs_bin.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(hdrs_bin.len());
+    
+    let header_bytes = if headers_end < hdrs_bin.len() {
+        &hdrs_bin[..headers_end + 4]
+    } else {
+        hdrs_bin
+    };
+    
+    // Parse headers using httparse
+    let mut headers = [httparse::EMPTY_HEADER; 100]; // Adjust size as needed
+    let mut req = httparse::Request::new(&mut headers);
+    
+    // Try to parse as a complete HTTP request first
+    match req.parse(header_bytes) {
+        Ok(httparse::Status::Complete(_)) => {
+            // Successfully parsed as request
+            let mut result = Vec::new();
+            for header in req.headers.iter() {
+                if header.name.is_empty() {
+                    break;
+                }
+                result.push((
+                    header.name.to_string(),
+                    String::from_utf8_lossy(header.value).to_string()
+                ));
+            }
+            Ok(result)
+        }
+        _ => {
+            // If not a complete request, try parsing just headers
+            parse_raw_headers(header_bytes)
+        }
+    }
+}
+
+fn parse_raw_headers(hdrs_bin: &[u8]) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut result = Vec::new();
+    let header_str = String::from_utf8_lossy(hdrs_bin);
+    
+    for line in header_str.lines() {
+        if line.is_empty() {
+            break;
+        }
+        
+        if let Some(colon_pos) = line.find(':') {
+            let name = line[..colon_pos].trim();
+            let value = line[colon_pos + 1..].trim();
+            result.push((name.to_string(), value.to_string()));
+        }
+    }
+    
+    Ok(result)
+}
+
+// Alternative: More robust version that handles SPOE binary format
+fn parse_spoe_headers(hdrs_bin: &[u8]) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    // SPOE might encode headers differently
+    // This depends on your SPOA configuration
+    
+    // If headers are sent as raw HTTP format
+    if hdrs_bin.starts_with(b"GET ") || hdrs_bin.starts_with(b"POST ") || 
+       hdrs_bin.starts_with(b"PUT ") || hdrs_bin.starts_with(b"DELETE ") {
+        return parse_haproxy_headers(hdrs_bin);
+    }
+    
+    // If headers are just key-value pairs without request line
+    let mut headers = Vec::new();
+    let data = String::from_utf8_lossy(hdrs_bin);
+    
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        
+        if let Some(sep_pos) = line.find(':') {
+            let key = line[..sep_pos].trim().to_string();
+            let value = line[sep_pos + 1..].trim().to_string();
+            headers.push((key, value));
+        }
+    }
+    
+    Ok(headers)
+}
+```
+
+To use this in your SPOA, add `httparse` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+httparse = "1.8"
+```
+
+Then use it in your SPOA handler:
+
+```rust
+// Example usage in your SPOA
+fn handle_spoe_message(hdrs_bin: &[u8]) {
+    match parse_haproxy_headers(hdrs_bin) {
+        Ok(headers) => {
+            for (name, value) in headers {
+                println!("Header: {} = {}", name, value);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to parse headers: {}", e);
+        }
+    }
+}
+```
+
+The key points:
+
+1. **`parse_haproxy_headers`** - Main function that attempts to parse headers using httparse
+2. **`parse_raw_headers`** - Fallback for simple header parsing if httparse fails
+3. **`parse_spoe_headers`** - Alternative that handles different SPOE encoding formats
+
+The exact format depends on how your HAProxy SPOE configuration sends the headers. If you're using `req.hdrs_bin`, it typically contains the raw HTTP headers including the request line, which httparse can handle directly.
